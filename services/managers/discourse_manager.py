@@ -8,6 +8,7 @@ import re
 from django.conf import settings
 from django.utils import timezone
 from services.models import GroupCache
+from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,8 @@ ENDPOINTS = {
     },
 }
 
+DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S.%f'
+REDIS_GROUP_KEY = 'discourse_groups'
 
 class DiscourseManager:
     def __init__(self):
@@ -198,22 +201,23 @@ class DiscourseManager:
 
     @staticmethod
     def __update_group_cache():
-        GroupCache.objects.filter(service="discourse").delete()
-        cache = GroupCache.objects.create(service="discourse")
-        cache.groups = json.dumps(DiscourseManager.__get_groups())
-        cache.save()
-        return cache
+        to_cache = {
+            'groups': DiscourseManager.__get_groups(),
+            'created': datetime.datetime.strftime(datetime.datetime.now(), DATETIME_FORMAT),
+        }
+        cache.set(REDIS_GROUP_KEY, json.dumps(to_cache))
 
     @staticmethod
-    def __get_group_cache():
-        if not GroupCache.objects.filter(service="discourse").exists():
+    def __verify_group_cache():
+        raw_cache = cache.get(REDIS_GROUP_KEY)
+        if raw_cache:
+            from_cache = json.loads(raw_cache)
+            age = datetime.datetime.now() - datetime.datetime.strptime(from_cache['created'], DATETIME_FORMAT)
+            if age > DiscourseManager.GROUP_CACHE_MAX_AGE:
+                logger.debug("Group cache has expired. Triggering update.")
+                DiscourseManager.__update_group_cache()
+        else:
             DiscourseManager.__update_group_cache()
-        cache = GroupCache.objects.get(service="discourse")
-        age = timezone.now() - cache.created
-        if age > DiscourseManager.GROUP_CACHE_MAX_AGE:
-            logger.debug("Group cache has expired. Triggering update.")
-            cache = DiscourseManager.__update_group_cache()
-        return json.loads(cache.groups)
 
     @staticmethod
     def __create_group(name):
@@ -223,9 +227,10 @@ class DiscourseManager:
 
     @staticmethod
     def __group_name_to_id(name):
-        cache = DiscourseManager.__get_group_cache()
-        for g in cache:
-            if g['name'] == name[0:20]:
+        DiscourseManager.__verify_group_cache()
+        groups = json.loads(cache.get(REDIS_GROUP_KEY))['groups']
+        for g in groups:
+            if g['name'] == name[:20]:
                 return g['id']
         logger.debug("Group %s not found on Discourse. Creating" % name)
         DiscourseManager.__create_group(name)
@@ -233,8 +238,10 @@ class DiscourseManager:
 
     @staticmethod
     def __group_id_to_name(id):
-        cache = DiscourseManager.__get_group_cache()
-        for g in cache:
+        DiscourseManager.__verify_group_cache()
+        groups = json.loads(cache.get(REDIS_GROUP_KEY))['groups']
+        print(groups)
+        for g in groups:
             if g['id'] == id:
                 return g['name']
         raise KeyError("Group ID %s not found on Discourse" % id)
@@ -373,6 +380,5 @@ class DiscourseManager:
         logger.debug("Disabling user %s Discourse access." % user)
         d_user = DiscourseManager.__get_user_by_external(user.pk)
         DiscourseManager.__logout(d_user['user']['id'])
-        DiscourseManager.__suspend_user(d_user['user']['username'])
         logger.info("Disabled user %s Discourse access." % user)
         return True
